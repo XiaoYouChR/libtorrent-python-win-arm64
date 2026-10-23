@@ -1,0 +1,75 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      libtorrent:
+        description: libtorrent version, e.g. 2.1.1
+        required: true
+      python:
+        description: Python version, e.g. 3.13
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Resolve release tag
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREFIX: v${{ inputs.libtorrent }}-py${{ inputs.python }}-
+        run: |
+          $numbers = gh release list --limit 1000 --json tagName --jq '.[].tagName' | Where-Object { $_.StartsWith($env:PREFIX) } | ForEach-Object { [int]$_.Substring($env:PREFIX.Length) }
+          $build = ($numbers | Measure-Object -Maximum).Maximum + 1
+          echo "build=$build" >> $env:GITHUB_OUTPUT
+          echo "tag=$env:PREFIX$build" >> $env:GITHUB_OUTPUT
+
+      - name: Build wheel
+        # b2 找不到编译器时会卡住而不是报错
+        timeout-minutes: 120
+        run: uv run --no-project python scripts/build_libtorrent_wheel.py "${{ inputs.libtorrent }}" "${{ inputs.python }}" wheelhouse
+
+      - name: Add build tag
+        shell: pwsh
+        run: uvx wheel tags --build ${{ steps.release.outputs.build }} --remove (Get-ChildItem wheelhouse/*.whl).FullName
+
+      - name: Check import
+        shell: pwsh
+        run: |
+          # runner 没装 ARM64 的 VC++ 运行库，libtorrent 依赖其中的 msvcp140.dll
+          Invoke-WebRequest -Uri "https://aka.ms/vc14/vc_redist.arm64.exe" -OutFile vc_redist.arm64.exe
+          Start-Process vc_redist.arm64.exe -ArgumentList "/install", "/quiet", "/norestart" -Wait
+          uv venv --python ${{ inputs.python }} check-venv
+          uv pip install --python check-venv (Get-ChildItem wheelhouse/*.whl).FullName
+          check-venv/Scripts/python -c "import libtorrent; print(libtorrent.__version__)"
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          $wheel = Get-ChildItem wheelhouse/*.whl
+          $sha256 = (Get-FileHash $wheel.FullName -Algorithm SHA256).Hash.ToLower()
+          $notes = @"
+          libtorrent ${{ inputs.libtorrent }} for CPython ${{ inputs.python }} on Windows ARM64.
+
+          | File | SHA-256 |
+          |---|---|
+          | ``$($wheel.Name)`` | ``$sha256`` |
+
+          Built from $env:GITHUB_SHA by $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
+          "@
+          # 不可变 Release 发布后不能再加附件，所以先建草稿、传完附件再发布
+          gh release create $env:TAG --draft --target $env:GITHUB_SHA --title $env:TAG --notes $notes
+          gh release upload $env:TAG $wheel.FullName
+          gh release edit $env:TAG --draft=false
